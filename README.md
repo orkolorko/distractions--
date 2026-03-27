@@ -57,7 +57,7 @@ If you need something gentler, this isn't the tool for you.
 
 3. Install dependencies (if needed):
    ```bash
-   sudo apt install zenity at chattr yad
+   sudo apt install zenity at yad e2fsprogs
    ```
 
 ## Usage
