@@ -213,6 +213,14 @@ class SetupView(Gtk.Box):
         self.activate_btn.set_sensitive(True)
         self.progress_label.set_text("Activation failed or was canceled.")
 
+    def reset_for_new_block(self):
+        self.activate_btn.set_sensitive(True)
+        self.progress_label.set_text("")
+        self.progress_label.hide()
+        self.progress_bar.set_fraction(0.0)
+        self.progress_bar.set_text("0%")
+        self.progress_bar.hide()
+
 
 class BlocklistEditor(Gtk.Dialog):
     """Embedded text editor for blocklists.txt. Returns an error string on
@@ -281,10 +289,11 @@ class BlocklistEditor(Gtk.Dialog):
 class CountdownView(Gtk.Box):
     """Live countdown driven by /var/lib/hardblock/end_time."""
 
-    def __init__(self):
+    def __init__(self, on_finished):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.set_border_width(24)
         self.set_valign(Gtk.Align.CENTER)
+        self._on_finished = on_finished
 
         title = Gtk.Label()
         title.set_markup(
@@ -317,6 +326,9 @@ class CountdownView(Gtk.Box):
             )
             self.end_label.set_text("")
             self._timer_id = None
+            # Hold the "Block ended" message for a beat, then hand control
+            # back to the caller so it can drop the user on the setup page.
+            GLib.timeout_add_seconds(2, self._fire_finished)
             return False
         remaining = max(0, end - int(time.time()))
         self.timer_label.set_markup(
@@ -331,6 +343,10 @@ class CountdownView(Gtk.Box):
             return False
         return True
 
+    def _fire_finished(self):
+        self._on_finished()
+        return False
+
 
 class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
@@ -341,7 +357,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.add(self.stack)
 
         self.setup_view = SetupView(self.run_block, BLOCKLIST_FILE)
-        self.countdown_view = CountdownView()
+        self.countdown_view = CountdownView(self._return_to_setup)
 
         self.stack.add_named(self.setup_view, "setup")
         self.stack.add_named(self.countdown_view, "countdown")
@@ -426,6 +442,10 @@ class MainWindow(Gtk.ApplicationWindow):
             )
             self._show_error(err_text)
             self.setup_view.reset_after_failure()
+
+    def _return_to_setup(self):
+        self.setup_view.reset_for_new_block()
+        self.stack.set_visible_child_name("setup")
 
     def _show_error(self, message):
         dialog = Gtk.MessageDialog(

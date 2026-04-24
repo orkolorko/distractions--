@@ -1,0 +1,20 @@
+[package]
+name = "distractions-gui"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Native GTK3 frontend for distractions--.sh"
+
+[[bin]]
+name = "distractions-gui"
+path = "src/main.rs"
+
+[dependencies]
+gtk = "0.18"
+gio = "0.18"
+glib = "0.18"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
