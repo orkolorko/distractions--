@@ -9,6 +9,98 @@ HOSTS_MODIFIED=false
 HOSTS_IMMUTABLE=false
 SERVICES_CREATED=false
 
+# ----------------------------------------------------------------------------
+# Argument parsing
+#
+# With no flags the script behaves exactly as before (interactive zenity).
+# With --duration the zenity form is skipped and inputs come from flags.
+# With --no-gui every zenity dialog is suppressed, the final confirmation is
+# implied, the optional countdown is skipped, and progress is emitted to
+# stdout as machine-readable PROGRESS:<pct>:<msg> lines for a wrapper UI.
+# The block-setup code path itself is unchanged in both modes.
+# ----------------------------------------------------------------------------
+ARG_DURATION=""
+ARG_PRESET=""
+ARG_SITES=""
+ARG_YES=false
+ARG_NO_GUI=false
+
+print_usage() {
+    cat <<EOF
+Usage: $0 [options]
+
+Run with no options to use the interactive zenity GUI (default).
+
+Non-interactive options:
+  --duration SPEC      Duration: 30m, 2h, 1d, etc. (required for non-interactive)
+  --preset NAME        all | social | adult | timewasters | none (default: none)
+  --sites "a b c"      Space-separated extra domains
+  --yes                Skip the final confirmation prompt
+  --no-gui             Suppress all zenity dialogs; implies --yes; emits
+                       PROGRESS:<pct>:<msg> lines on stdout for wrappers
+  -h, --help           Show this message
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --duration)     ARG_DURATION="$2"; shift 2 ;;
+        --preset)       ARG_PRESET="$2"; shift 2 ;;
+        --sites)        ARG_SITES="$2"; shift 2 ;;
+        --yes)          ARG_YES=true; shift ;;
+        --no-gui)       ARG_NO_GUI=true; ARG_YES=true; shift ;;
+        -h|--help)      print_usage; exit 0 ;;
+        *)              echo "Unknown option: $1" >&2; print_usage >&2; exit 2 ;;
+    esac
+done
+
+if [ "$ARG_NO_GUI" = true ] && [ -z "$ARG_DURATION" ]; then
+    echo "ERROR: --no-gui requires --duration" >&2
+    exit 2
+fi
+
+# ----------------------------------------------------------------------------
+# Output helpers - route through zenity in GUI mode, plain text in --no-gui mode
+# ----------------------------------------------------------------------------
+report_error() {
+    local title="$1" message="$2"
+    if [ "$ARG_NO_GUI" = true ]; then
+        printf 'ERROR: %s: %s\n' "$title" "$message" >&2
+    else
+        zenity --error --title="$title" --text="$message" 2>/dev/null
+    fi
+}
+
+report_info() {
+    local title="$1" message="$2"
+    if [ "$ARG_NO_GUI" = true ]; then
+        printf 'INFO: %s: %s\n' "$title" "$message"
+    else
+        zenity --info --title="$title" --text="$message" 2>/dev/null
+    fi
+}
+
+emit_progress() {
+    local pct="$1" msg="$2"
+    if [ "$ARG_NO_GUI" = true ]; then
+        printf 'PROGRESS:%s:%s\n' "$pct" "$msg"
+    else
+        echo "$pct"
+        echo "# $msg"
+    fi
+}
+
+normalize_preset() {
+    case "$1" in
+        all|All)                            echo "All" ;;
+        social|"Social Media Only")         echo "Social Media Only" ;;
+        adult|"Adult Content Only")         echo "Adult Content Only" ;;
+        timewasters|"Time Wasters Only")    echo "Time Wasters Only" ;;
+        none|None|"")                       echo "None" ;;
+        *)                                  return 1 ;;
+    esac
+}
+
 # Signal handler for clean exit on CTRL+C or other interruptions
 cleanup() {
     echo -e "\n[!] Script interrupted. Cleaning up..."
@@ -49,8 +141,10 @@ cleanup() {
     
     echo "[*] Cleanup complete. Exiting."
     
-    # Show GUI notification of cancellation if zenity is available
-    if [ -n "$DISPLAY" ] && command -v zenity &>/dev/null; then
+    # Notify user of cancellation
+    if [ "$ARG_NO_GUI" = true ]; then
+        echo "[*] Operation canceled. Hosts file restored." >&2
+    elif [ -n "$DISPLAY" ] && command -v zenity &>/dev/null; then
         zenity --info --title="Operation Canceled" --text="Website blocking was interrupted and canceled.\nYour system has been restored to its previous state." 2>/dev/null
     fi
     
@@ -62,7 +156,7 @@ trap cleanup SIGINT SIGTERM SIGHUP
 
 # Force script to run as root
 if [ "$EUID" -ne 0 ]; then
-  zenity --error --title="Root Access Required" --text="This script must be run with sudo privileges.\n\nPlease run:\nsudo .$0"
+  report_error "Root Access Required" "This script must be run with sudo privileges.\n\nPlease run:\nsudo $0"
   exit 1
 fi
 
@@ -71,7 +165,11 @@ LOCK_DIR="/var/lib/hardblock"
 mkdir -p "$LOCK_DIR"
 
 # Ensure dependencies are installed
-DEPENDENCIES=(zenity at chattr systemd-run date)
+if [ "$ARG_NO_GUI" = true ]; then
+    DEPENDENCIES=(at chattr systemd-run date)
+else
+    DEPENDENCIES=(zenity at chattr systemd-run date)
+fi
 MISSING_DEPS=()
 
 for cmd in "${DEPENDENCIES[@]}"; do
@@ -81,8 +179,7 @@ for cmd in "${DEPENDENCIES[@]}"; do
 done
 
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
-    zenity --error --title="Missing Dependencies" \
-           --text="The following required tools are not installed:\n\n$(printf "• %s\n" "${MISSING_DEPS[@]}")\n\nPlease install them with:\nsudo apt install ${MISSING_DEPS[*]}"
+    report_error "Missing Dependencies" "The following required tools are not installed:\n\n$(printf "• %s\n" "${MISSING_DEPS[@]}")\n\nPlease install them with:\nsudo apt install ${MISSING_DEPS[*]}"
     exit 1
 fi
 
@@ -152,8 +249,7 @@ if [ -f "$LOCK_DIR/block_active" ] && [ -f "$LOCK_DIR/end_time" ]; then
         HOURS=$((REMAINING / 3600))
         MINUTES=$(((REMAINING % 3600) / 60))
         
-        zenity --error --title="Block Already Active" \
-               --text="A website block is already in progress!\n\nTime remaining: ${HOURS}h ${MINUTES}m\n\nThis block CANNOT be lifted until the timer expires."
+        report_error "Block Already Active" "A website block is already in progress!\n\nTime remaining: ${HOURS}h ${MINUTES}m\n\nThis block CANNOT be lifted until the timer expires."
         exit 1
     else
         # Clean up expired block
@@ -161,69 +257,95 @@ if [ -f "$LOCK_DIR/block_active" ] && [ -f "$LOCK_DIR/end_time" ]; then
     fi
 fi
 
-# Default block list with categories
-DEFAULT_BLOCKS=(
-    # Social Media
-    "facebook.com www.facebook.com"
-    "instagram.com www.instagram.com"
-    "twitter.com www.twitter.com x.com www.x.com"
-    "reddit.com www.reddit.com old.reddit.com"
-    "tiktok.com www.tiktok.com"
-    
-    # Adult Content
-    "pornhub.com www.pornhub.com"
-    "xvideos.com www.xvideos.com"
-    "xnxx.com www.xnxx.com"
-    "redtube.com www.redtube.com"
-    "rule34.xxx www.rule34.xxx"
-    "spankbang.com www.spankbang.com"
-    
-    # Time Wasters
-    "youtube.com www.youtube.com"
-    "netflix.com www.netflix.com"
-    "twitch.tv www.twitch.tv"
-    "hulu.com www.hulu.com"
-)
+# Block list source: blocklists.txt next to the script (INI-style sections).
+# Falls back to embedded defaults if the file is missing so the script still
+# works standalone. The file may be edited freely between blocks; edits do
+# NOT affect a block already in progress (its domains were baked into
+# /etc/hosts at activation time).
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+BLOCKLIST_FILE="$SCRIPT_DIR/blocklists.txt"
 
-# Show GUI for configuration
-CONFIG=$(zenity --forms --title="HardBlock Configuration" \
-    --text="<span color='red'><b>⚠️ WARNING: This block CANNOT be reversed until the timer ends!</b></span>" \
-    --add-combo="Block Duration:" --combo-values="30 minutes|1 hour|2 hours|4 hours|8 hours|Custom..." \
-    --add-entry="Custom Duration (e.g., 3 hours, 90 minutes):" \
-    --add-entry="Additional websites to block (space-separated):" \
-    --add-combo="Block Preset:" --combo-values="All|Social Media Only|Adult Content Only|Time Wasters Only|None" \
-    --width=500 --height=350)
+BLOCKS_SOCIAL=()
+BLOCKS_ADULT=()
+BLOCKS_TIMEWASTERS=()
 
-# Exit if canceled
-if [ $? -ne 0 ]; then
-    zenity --info --title="Operation Canceled" --text="Website blocking canceled."
-    exit 0
-fi
+load_blocklists() {
+    local file="$1" line section=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"                                 # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"            # ltrim
+        line="${line%"${line##*[![:space:]]}"}"            # rtrim
+        [ -z "$line" ] && continue
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        case "$section" in
+            social)      BLOCKS_SOCIAL+=("$line") ;;
+            adult)       BLOCKS_ADULT+=("$line") ;;
+            timewasters) BLOCKS_TIMEWASTERS+=("$line") ;;
+        esac
+    done < "$file"
+}
 
-# Parse the form input
-DURATION_CHOICE=$(echo "$CONFIG" | cut -d'|' -f1)
-CUSTOM_DURATION=$(echo "$CONFIG" | cut -d'|' -f2)
-ADDITIONAL_SITES=$(echo "$CONFIG" | cut -d'|' -f3)
-PRESET_CHOICE=$(echo "$CONFIG" | cut -d'|' -f4)
-
-# Determine final duration
-if [ "$DURATION_CHOICE" = "Custom..." ]; then
-    if [ -z "$CUSTOM_DURATION" ]; then
-        zenity --error --title="Invalid Duration" --text="No custom duration specified. Please try again."
-        exit 1
-    fi
-    DURATION="$CUSTOM_DURATION"
+if [ -f "$BLOCKLIST_FILE" ]; then
+    load_blocklists "$BLOCKLIST_FILE"
 else
-    DURATION="$DURATION_CHOICE"
+    BLOCKS_SOCIAL=(facebook.com www.facebook.com instagram.com www.instagram.com twitter.com www.twitter.com x.com www.x.com reddit.com www.reddit.com old.reddit.com tiktok.com www.tiktok.com)
+    BLOCKS_ADULT=(pornhub.com www.pornhub.com xvideos.com www.xvideos.com xnxx.com www.xnxx.com redtube.com www.redtube.com rule34.xxx www.rule34.xxx spankbang.com www.spankbang.com)
+    BLOCKS_TIMEWASTERS=(youtube.com www.youtube.com netflix.com www.netflix.com twitch.tv www.twitch.tv hulu.com www.hulu.com)
 fi
+
+if [ -z "$ARG_DURATION" ]; then
+    # Show GUI for configuration
+    CONFIG=$(zenity --forms --title="HardBlock Configuration" \
+        --text="<span color='red'><b>⚠️ WARNING: This block CANNOT be reversed until the timer ends!</b></span>" \
+        --add-combo="Block Duration:" --combo-values="30 minutes|1 hour|2 hours|4 hours|8 hours|Custom..." \
+        --add-entry="Custom Duration (e.g., 3 hours, 90 minutes):" \
+        --add-entry="Additional websites to block (space-separated):" \
+        --add-combo="Block Preset:" --combo-values="All|Social Media Only|Adult Content Only|Time Wasters Only|None" \
+        --width=500 --height=350)
+
+    # Exit if canceled
+    if [ $? -ne 0 ]; then
+        zenity --info --title="Operation Canceled" --text="Website blocking canceled."
+        exit 0
+    fi
+
+    # Parse the form input
+    DURATION_CHOICE=$(echo "$CONFIG" | cut -d'|' -f1)
+    CUSTOM_DURATION=$(echo "$CONFIG" | cut -d'|' -f2)
+    ADDITIONAL_SITES=$(echo "$CONFIG" | cut -d'|' -f3)
+    PRESET_CHOICE=$(echo "$CONFIG" | cut -d'|' -f4)
+
+    # Determine final duration
+    if [ "$DURATION_CHOICE" = "Custom..." ]; then
+        if [ -z "$CUSTOM_DURATION" ]; then
+            zenity --error --title="Invalid Duration" --text="No custom duration specified. Please try again."
+            exit 1
+        fi
+        DURATION="$CUSTOM_DURATION"
+    else
+        DURATION="$DURATION_CHOICE"
+    fi
+else
+    DURATION="$ARG_DURATION"
+    ADDITIONAL_SITES="$ARG_SITES"
+    PRESET_CHOICE="$ARG_PRESET"
+fi
+
+# Normalize preset (accepts both GUI labels and CLI shorthand)
+PRESET_CHOICE=$(normalize_preset "$PRESET_CHOICE") || {
+    report_error "Invalid Preset" "Unknown preset: '$ARG_PRESET'. Valid: all, social, adult, timewasters, none."
+    exit 1
+}
 
 # Convert duration to seconds for timer calculation
 DURATION_SECONDS=$(duration_to_seconds "$DURATION")
 
 # Check if we have a valid duration
 if [ "$DURATION_SECONDS" -eq 0 ]; then
-    zenity --error --title="Invalid Duration Format" \
-           --text="The duration '$DURATION' could not be parsed.\n\nPlease use formats like:\n• 30m or 30 minutes\n• 2h or 2 hours\n• 1d or 1 day"
+    report_error "Invalid Duration Format" "The duration '$DURATION' could not be parsed.\n\nPlease use formats like:\n• 30m or 30 minutes\n• 2h or 2 hours\n• 1d or 1 day"
     exit 1
 fi
 
@@ -261,12 +383,14 @@ format_duration() {
 
 FORMATTED_DURATION=$(format_duration $DURATION_SECONDS)
 
-# Final confirmation with stronger warning
-if ! zenity --question --title="FINAL WARNING" \
-    --text="<span color='red' size='large'><b>⚠️ POINT OF NO RETURN ⚠️</b></span>\n\nYou are about to block distracting websites for: <b>$FORMATTED_DURATION</b>\n\n<b>This action CANNOT be undone!</b>\n\nEven restarting your computer will NOT remove the block.\nAre you ABSOLUTELY sure you want to proceed?" \
-    --width=400; then
-    zenity --info --title="Operation Canceled" --text="Website blocking canceled."
-    exit 0
+# Final confirmation with stronger warning (skipped when --yes / --no-gui)
+if [ "$ARG_YES" != true ]; then
+    if ! zenity --question --title="FINAL WARNING" \
+        --text="<span color='red' size='large'><b>⚠️ POINT OF NO RETURN ⚠️</b></span>\n\nYou are about to block distracting websites for: <b>$FORMATTED_DURATION</b>\n\n<b>This action CANNOT be undone!</b>\n\nEven restarting your computer will NOT remove the block.\nAre you ABSOLUTELY sure you want to proceed?" \
+        --width=400; then
+        zenity --info --title="Operation Canceled" --text="Website blocking canceled."
+        exit 0
+    fi
 fi
 
 # Build the list of domains to block based on preset
@@ -274,32 +398,16 @@ DOMAINS=()
 
 case "$PRESET_CHOICE" in
     "All")
-        for entry in "${DEFAULT_BLOCKS[@]}"; do
-            for domain in $entry; do
-                DOMAINS+=("$domain")
-            done
-        done
+        DOMAINS+=("${BLOCKS_SOCIAL[@]}" "${BLOCKS_ADULT[@]}" "${BLOCKS_TIMEWASTERS[@]}")
         ;;
     "Social Media Only")
-        for ((i=0; i<5; i++)); do
-            for domain in ${DEFAULT_BLOCKS[$i]}; do
-                DOMAINS+=("$domain")
-            done
-        done
+        DOMAINS+=("${BLOCKS_SOCIAL[@]}")
         ;;
     "Adult Content Only")
-        for ((i=5; i<11; i++)); do
-            for domain in ${DEFAULT_BLOCKS[$i]}; do
-                DOMAINS+=("$domain")
-            done
-        done
+        DOMAINS+=("${BLOCKS_ADULT[@]}")
         ;;
     "Time Wasters Only")
-        for ((i=11; i<15; i++)); do
-            for domain in ${DEFAULT_BLOCKS[$i]}; do
-                DOMAINS+=("$domain")
-            done
-        done
+        DOMAINS+=("${BLOCKS_TIMEWASTERS[@]}")
         ;;
     "None")
         # No preset domains selected
@@ -320,14 +428,14 @@ fi
 
 # Check if we have domains to block
 if [ ${#DOMAINS[@]} -eq 0 ]; then
-    zenity --error --title="No Domains Selected" \
-           --text="You didn't select any domains or categories to block.\nPlease try again."
+    report_error "No Domains Selected" "You didn't select any domains or categories to block.\nPlease try again."
     exit 1
 fi
 
-# Show progress dialog
-(
-echo "10"; echo "# Creating backup of hosts file..."
+# Block setup body - identical work in both GUI and --no-gui modes; only the
+# progress sink differs (zenity vs PROGRESS:pct:msg lines on stdout).
+do_block_setup() {
+emit_progress 10 "Creating backup of hosts file..."
 sleep 0.5
 
 # Backup the hosts file if we haven't already
@@ -335,7 +443,7 @@ if [ ! -f "/etc/hosts.hardblock.bak" ]; then
     cp /etc/hosts /etc/hosts.hardblock.bak
 fi
 
-echo "20"; echo "# Preparing block entries..."
+emit_progress 20 "Preparing block entries..."
 sleep 0.5
 
 # Create hosts file entries
@@ -345,7 +453,7 @@ for domain in "${DOMAINS[@]}"; do
     BLOCK_ENTRIES+="::1 $domain\n"
 done
 
-echo "30"; echo "# Updating hosts file..."
+emit_progress 30 "Updating hosts file..."
 
 # Remove previous blocks if they exist
 if grep -q "# HARDBLOCK START" /etc/hosts; then
@@ -358,19 +466,19 @@ HOSTS_MODIFIED=true
 # Add block entries to hosts file
 echo -e "\n# HARDBLOCK START\n$BLOCK_ENTRIES# HARDBLOCK END" >> /etc/hosts
 
-echo "40"; echo "# Setting up persistence..."
+emit_progress 40 "Setting up persistence..."
 
 # Save end time for later retrieval
 echo "$END_TIME" > "$LOCK_DIR/end_time"
 touch "$LOCK_DIR/block_active"
 
-echo "50"; echo "# Making hosts file immutable..."
+emit_progress 50 "Making hosts file immutable..."
 
 # Make hosts file immutable (can't be changed even by root)
 chattr +i /etc/hosts
 HOSTS_IMMUTABLE=true
 
-echo "60"; echo "# Creating unblock script..."
+emit_progress 60 "Creating unblock script..."
 
 # Create unblock script that will be run by systemd timer
 cat > "$LOCK_DIR/unblock.sh" << 'EOF'
@@ -400,7 +508,7 @@ EOF
 
 chmod +x "$LOCK_DIR/unblock.sh"
 
-echo "70"; echo "# Setting up systemd services..."
+emit_progress 70 "Setting up systemd services..."
 
 # Create a systemd service for unblocking
 cat > /etc/systemd/system/hardblock-unblock.service << EOF
@@ -435,31 +543,39 @@ EOF
 # Flag that we've created systemd services (for cleanup)
 SERVICES_CREATED=true
 
-echo "80"; echo "# Enabling services..."
+emit_progress 80 "Enabling services..."
 
 # Enable and start the timer
 systemctl daemon-reload
 systemctl enable hardblock-unblock.timer
 systemctl start hardblock-unblock.timer
 
-echo "90"; echo "# Scheduling backup unblock..."
+emit_progress 90 "Scheduling backup unblock..."
 
 # Schedule the unblock using at as a backup mechanism
 # Use seconds to be precise
 echo "$LOCK_DIR/unblock.sh" | at now + ${DURATION_SECONDS} seconds 2>/dev/null
 
-echo "100"; echo "# Block successfully activated!"
+emit_progress 100 "Block successfully activated!"
 sleep 1
-) | zenity --progress \
-           --title="Setting Up Website Block" \
-           --text="Initializing..." \
-           --percentage=0 \
-           --auto-close \
-           --no-cancel
+}
+
+if [ "$ARG_NO_GUI" = true ]; then
+    do_block_setup
+    setup_status=$?
+else
+    do_block_setup | zenity --progress \
+               --title="Setting Up Website Block" \
+               --text="Initializing..." \
+               --percentage=0 \
+               --auto-close \
+               --no-cancel
+    setup_status=${PIPESTATUS[0]}
+fi
 
 # If progress dialog was canceled (unlikely due to --no-cancel),
 # but handle it anyway for robustness
-if [ $? -ne 0 ]; then
+if [ "$setup_status" -ne 0 ]; then
     cleanup
     exit 1
 fi
@@ -467,8 +583,9 @@ fi
 # Format end time for display
 END_TIME_FORMATTED=$(date -d "@$END_TIME" "+%a %b %d %H:%M:%S %Y")
 
-# Create a desktop countdown timer app if user wants it
-if zenity --question --title="Show Countdown" --text="Would you like to open a countdown timer window?"; then
+# Create a desktop countdown timer app if user wants it (skipped in --no-gui mode;
+# wrappers render their own countdown by reading /var/lib/hardblock/end_time).
+if [ "$ARG_NO_GUI" != true ] && zenity --question --title="Show Countdown" --text="Would you like to open a countdown timer window?"; then
     # Create countdown script
     COUNTDOWN_SCRIPT="$LOCK_DIR/countdown.sh"
     cat > "$COUNTDOWN_SCRIPT" << EOF
@@ -575,8 +692,13 @@ if command -v notify-send &>/dev/null; then
 fi
 
 # Notify user of successful block
-zenity --info --width=400 --title="Websites Blocked" \
-    --text="<b>✅ Websites successfully blocked for $FORMATTED_DURATION</b>\n\nThe block is now <span color='red'><b>IRREVERSIBLE</b></span> until the timer ends.\n\nEven restarting your computer will not remove the block.\n\nTimer will expire at: <b>$END_TIME_FORMATTED</b>"
+if [ "$ARG_NO_GUI" = true ]; then
+    printf 'INFO: Websites Blocked: blocked for %s, ends at %s\n' \
+        "$FORMATTED_DURATION" "$END_TIME_FORMATTED"
+else
+    zenity --info --width=400 --title="Websites Blocked" \
+        --text="<b>✅ Websites successfully blocked for $FORMATTED_DURATION</b>\n\nThe block is now <span color='red'><b>IRREVERSIBLE</b></span> until the timer ends.\n\nEven restarting your computer will not remove the block.\n\nTimer will expire at: <b>$END_TIME_FORMATTED</b>"
+fi
 
 # Flush DNS cache to ensure blocks take effect immediately
 if command -v systemd-resolve &> /dev/null; then
