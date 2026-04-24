@@ -1,0 +1,11 @@
+# Time-waster domains (video, streaming). One per line. '#' starts a comment.
+# Edits apply to the NEXT activation, not to a block already in progress.
+
+youtube.com
+www.youtube.com
+netflix.com
+www.netflix.com
+twitch.tv
+www.twitch.tv
+hulu.com
+www.hulu.com

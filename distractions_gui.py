@@ -20,10 +20,17 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 SCRIPT_PATH = Path(__file__).resolve().parent / "distractions--.sh"
-BLOCKLIST_FILE = Path(__file__).resolve().parent / "blocklists.txt"
+BLOCKLIST_DIR = Path(__file__).resolve().parent / "blocklists"
 STATE_DIR = Path("/var/lib/hardblock")
 END_TIME_FILE = STATE_DIR / "end_time"
 ACTIVE_FILE = STATE_DIR / "block_active"
+
+# Per-category files inside BLOCKLIST_DIR. Tuples of (category-key, label, filename).
+BLOCKLIST_CATEGORIES = (
+    ("social", "Social media", "social.txt"),
+    ("adult", "Adult content", "adult.txt"),
+    ("timewasters", "Time wasters", "timewasters.txt"),
+)
 
 PRESETS = [
     ("none", "No preset (use custom sites only)"),
@@ -64,11 +71,11 @@ def format_remaining(seconds):
 class SetupView(Gtk.Box):
     """Form + activate button + inline progress."""
 
-    def __init__(self, on_activate, blocklist_path):
+    def __init__(self, on_activate, blocklist_dir):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.set_border_width(16)
         self._on_activate = on_activate
-        self._blocklist_path = blocklist_path
+        self._blocklist_dir = blocklist_dir
 
         warning = Gtk.Label()
         warning.set_markup(
@@ -142,7 +149,7 @@ class SetupView(Gtk.Box):
 
     def _on_edit_blocklists(self, _btn):
         parent = self.get_toplevel()
-        editor = BlocklistEditor(parent, self._blocklist_path)
+        editor = BlocklistEditor(parent, self._blocklist_dir)
         error = editor.run_and_save()
         if error:
             dialog = Gtk.MessageDialog(
@@ -223,17 +230,20 @@ class SetupView(Gtk.Box):
 
 
 class BlocklistEditor(Gtk.Dialog):
-    """Embedded text editor for blocklists.txt. Returns an error string on
-    save failure so the caller can surface it; None means success or cancel."""
+    """Tabbed editor for the per-category blocklists. One Gtk.TextView per
+    category. Returns an error string on save failure so the caller can
+    surface it; None means success or cancel."""
 
-    def __init__(self, parent, path):
+    def __init__(self, parent, blocklist_dir):
         super().__init__(
-            title="Edit blocklists.txt",
+            title="Edit blocklists",
             transient_for=parent,
             modal=True,
         )
-        self._path = path
-        self.set_default_size(580, 540)
+        self._blocklist_dir = blocklist_dir
+        self._tabs = []  # list of (path, textview, original_text)
+
+        self.set_default_size(640, 580)
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
         save_btn = self.add_button("Save", Gtk.ResponseType.OK)
         save_btn.get_style_context().add_class("suggested-action")
@@ -245,30 +255,32 @@ class BlocklistEditor(Gtk.Dialog):
         info = Gtk.Label(xalign=0)
         info.set_markup(
             "<small>Edits apply to the <b>next</b> activation, not to a "
-            "block already in progress.</small>"
+            "block already in progress. Only modified tabs are written.</small>"
         )
         content.pack_start(info, False, False, 0)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self._textview = Gtk.TextView()
-        self._textview.set_monospace(True)
-        self._textview.set_left_margin(8)
-        self._textview.set_right_margin(8)
-        self._textview.set_top_margin(8)
-        self._textview.set_bottom_margin(8)
-        try:
-            initial = path.read_text()
-        except FileNotFoundError:
-            initial = (
-                "# blocklists.txt did not exist; will be created on save.\n"
-                "[social]\n\n[adult]\n\n[timewasters]\n"
-            )
-        except OSError as err:
-            initial = f"# Failed to read {path}: {err}\n"
-        self._textview.get_buffer().set_text(initial)
-        scroll.add(self._textview)
-        content.pack_start(scroll, True, True, 0)
+        notebook = Gtk.Notebook()
+        for _key, label, filename in BLOCKLIST_CATEGORIES:
+            path = blocklist_dir / filename
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            textview = Gtk.TextView()
+            textview.set_monospace(True)
+            textview.set_left_margin(8)
+            textview.set_right_margin(8)
+            textview.set_top_margin(8)
+            textview.set_bottom_margin(8)
+            try:
+                initial = path.read_text()
+            except FileNotFoundError:
+                initial = f"# {filename} will be created on save.\n"
+            except OSError as err:
+                initial = f"# Failed to read {path}: {err}\n"
+            textview.get_buffer().set_text(initial)
+            scroll.add(textview)
+            notebook.append_page(scroll, Gtk.Label(label=label))
+            self._tabs.append((path, textview, initial))
+        content.pack_start(notebook, True, True, 0)
 
         self.show_all()
 
@@ -276,12 +288,23 @@ class BlocklistEditor(Gtk.Dialog):
         response = self.run()
         error = None
         if response == Gtk.ResponseType.OK:
-            buf = self._textview.get_buffer()
-            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
             try:
-                self._path.write_text(text)
+                self._blocklist_dir.mkdir(parents=True, exist_ok=True)
             except OSError as err:
-                error = f"{self._path}: {err}"
+                error = f"{self._blocklist_dir}: {err}"
+            else:
+                for path, textview, original in self._tabs:
+                    buf = textview.get_buffer()
+                    current = buf.get_text(
+                        buf.get_start_iter(), buf.get_end_iter(), True
+                    )
+                    if current == original:
+                        continue
+                    try:
+                        path.write_text(current)
+                    except OSError as err:
+                        error = f"{path}: {err}"
+                        break
         self.destroy()
         return error
 
@@ -356,7 +379,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.stack = Gtk.Stack()
         self.add(self.stack)
 
-        self.setup_view = SetupView(self.run_block, BLOCKLIST_FILE)
+        self.setup_view = SetupView(self.run_block, BLOCKLIST_DIR)
         self.countdown_view = CountdownView(self._return_to_setup)
 
         self.stack.add_named(self.setup_view, "setup")

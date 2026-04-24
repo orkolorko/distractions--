@@ -12,6 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - **Interactive zenity** (no flags): the default. Shows a form, then a progress dialog.
    - **Non-interactive / wrapper mode** (`--no-gui --duration … --preset … [--sites …]`): suppresses every zenity dialog, implies `--yes`, skips the optional countdown, and emits machine-readable progress lines on stdout.
 2. **`distractions_gui.py`** — GTK3 (PyGObject) frontend. Runs unprivileged, collects inputs, and shells out to the bash script via `pkexec --no-gui …`. Polkit handles the auth prompt; the GUI itself never needs root. Covered in detail under *GTK frontend* below.
+3. **`distractions-gui-rs/`** — Rust+gtk-rs 0.18 port of the Python frontend. Same wire protocol (pkexec → bash → `PROGRESS:<pct>:<msg>`), same UX, no Python interpreter required. Single binary built with `cargo build --release`, ~390 KB stripped. Locates the bash script via `$DISTRACTIONS_SCRIPT`, then by walking up from the binary, then `/usr/local/bin` and `/usr/bin`.
 
 ## Running
 
@@ -20,12 +21,15 @@ chmod +x distractions--.sh
 sudo ./distractions--.sh                                    # interactive zenity
 sudo ./distractions--.sh --duration 2h --preset social --yes # CLI, sees zenity errors
 sudo ./distractions--.sh --no-gui --duration 2h --preset all # wrapper mode
-./distractions_gui.py                                       # GTK frontend (no sudo)
+./distractions_gui.py                                       # Python GTK frontend (no sudo)
+distractions-gui-rs/target/release/distractions-gui         # Rust GTK frontend (no sudo)
 ```
 
-There is no build step, no test suite, and no linter configured. For local syntax checks use `bash -n distractions--.sh` or `shellcheck distractions--.sh`; the Python frontend can be parse-checked with `python3 -c "import ast; ast.parse(open('distractions_gui.py').read())"`.
+The Python and Rust frontends register the same DBus name (`org.distractions.gui`) and are mutually exclusive single instances — launching one while the other runs is a no-op handoff (the second process exits 0).
 
-Runtime dependencies (checked at startup): `at`, `chattr`, `systemd-run`, `date` — plus `zenity` unless `--no-gui` is set. Optional: `yad` (countdown window), `notify-send` (desktop notifications), `systemd-resolve`/`resolvectl` (DNS cache flush). The GTK frontend additionally needs `python3-gi` + `gir1.2-gtk-3.0` + `pkexec`.
+There is no build step, no test suite, and no linter configured for the bash and Python sides. For local syntax checks use `bash -n distractions--.sh` or `shellcheck distractions--.sh`; the Python frontend can be parse-checked with `python3 -c "import ast; ast.parse(open('distractions_gui.py').read())"`. The Rust frontend uses `cargo check` / `cargo build --release` from `distractions-gui-rs/`.
+
+Runtime dependencies (checked at startup): `at`, `chattr`, `systemd-run`, `date` — plus `zenity` unless `--no-gui` is set. Optional: `yad` (countdown window), `notify-send` (desktop notifications), `systemd-resolve`/`resolvectl` (DNS cache flush). The Python frontend additionally needs `python3-gi` + `gir1.2-gtk-3.0` + `pkexec`. The Rust frontend needs `libgtk-3-0` + `pkexec` at runtime; build needs `libgtk-3-dev` + a Rust toolchain.
 
 ## Architecture
 
@@ -46,9 +50,11 @@ The `cleanup()` function (trapped on `SIGINT`/`SIGTERM`/`SIGHUP`) restores the s
 
 ### Block presets
 
-Domains live in `blocklists.txt` next to the script, parsed at startup into `BLOCKS_SOCIAL` / `BLOCKS_ADULT` / `BLOCKS_TIMEWASTERS` by `load_blocklists()`. Format is INI-style: `[social]`/`[adult]`/`[timewasters]` headers, one domain per line, `#` comments and blank lines ignored, unknown sections silently dropped. If the file is missing the script falls back to a hardcoded copy of the same lists so it still works standalone — keep that fallback in sync with the file when adding new categories.
+Domains live in `blocklists/{social,adult,timewasters}.txt` next to the script — one bare domain per line, `#` comments and blank lines ignored. Each file is loaded into the corresponding `BLOCKS_SOCIAL` / `BLOCKS_ADULT` / `BLOCKS_TIMEWASTERS` array via `load_category_file()` + `mapfile`. If the directory is missing, the script first tries a legacy single-file `blocklists.txt` (INI-style with `[social]`/`[adult]`/`[timewasters]` sections) via `load_legacy_blocklist()` for backward compatibility with older clones; if that's also missing or all arrays end up empty, it falls back to a hardcoded copy of the same lists so it still works standalone — keep that fallback in sync when adding new categories.
 
-The file path is resolved via `readlink -f "$0"` (script directory), so it works regardless of CWD or whether the script was invoked through `pkexec`. Edits between blocks take effect on the next activation; edits during a block do not affect the in-progress one (its `/etc/hosts` entries were baked in at activation).
+The directory path is resolved via `readlink -f "$0"` (script directory), so it works regardless of CWD or whether the script was invoked through `pkexec`. Edits between blocks take effect on the next activation; edits during a block do not affect the in-progress one (its `/etc/hosts` entries were baked in at activation).
+
+`blocklists/adult.txt` is bootstrapped from a snapshot of the [StevenBlack/hosts](https://github.com/StevenBlack/hosts) `alternates/porn-only` list (~76k domains), merged with the project's hand-curated entries. To refresh from upstream, fetch the latest hosts file, normalize to bare domains (strip `0.0.0.0`/comments/blanks), `sort -u` together with the curated entries, and overwrite the file. The snapshot is intentional — pulling at activation time would slow `/etc/hosts` lookups by ~76k linear-scan entries on every block; the snapshot keeps `/etc/hosts` work to once per activation and offline-safe.
 
 ### Wrapper protocol (`--no-gui`)
 
@@ -66,7 +72,7 @@ If you add a new error/info path, route it through `report_error`/`report_info` 
 
 PyGObject + GTK3, single file, runs as the unprivileged user. Two `Gtk.Stack` pages:
 
-- **Setup** (`SetupView`): duration spinner + unit dropdown, preset combo with an "Edit list..." button (opens `BlocklistEditor` — a TextView dialog that loads/saves `blocklists.txt`), custom-sites entry, activate button with confirmation dialog. On activate it spawns `pkexec ./distractions--.sh --no-gui --duration … --preset … [--sites …]` via `Gio.Subprocess`, parses `PROGRESS:` lines into the inline progress bar, and buffers stderr to surface in an error dialog if the subprocess fails (which includes the user dismissing the polkit prompt).
+- **Setup** (`SetupView`): duration spinner + unit dropdown, preset combo with an "Edit list..." button (opens `BlocklistEditor` — a `Gtk.Notebook` with one tab per category, each backed by a `TextView` over `blocklists/<category>.txt`; only modified tabs are written on save), custom-sites entry, activate button with confirmation dialog. On activate it spawns `pkexec ./distractions--.sh --no-gui --duration … --preset … [--sites …]` via `Gio.Subprocess`, parses `PROGRESS:` lines into the inline progress bar, and buffers stderr to surface in an error dialog if the subprocess fails (which includes the user dismissing the polkit prompt).
 - **Countdown** (`CountdownView`): polls `/var/lib/hardblock/end_time` every second via `GLib.timeout_add_seconds`. Picks itself when the window opens with a block already active, and is switched in by `MainWindow` after a successful activation.
 
 The GUI never reads or writes anything in `/var/lib/hardblock` itself — `end_time` is created world-readable by the bash script (default umask 022 under root), so the unprivileged poll loop just works. The script is the only privileged surface; the GUI never asks for root for itself (in fact `main()` refuses to start as root). All design choices follow from the constraint of not touching the tested block-setup code path.

@@ -257,24 +257,40 @@ if [ -f "$LOCK_DIR/block_active" ] && [ -f "$LOCK_DIR/end_time" ]; then
     fi
 fi
 
-# Block list source: blocklists.txt next to the script (INI-style sections).
-# Falls back to embedded defaults if the file is missing so the script still
-# works standalone. The file may be edited freely between blocks; edits do
-# NOT affect a block already in progress (its domains were baked into
-# /etc/hosts at activation time).
+# Block list source: blocklists/{social,adult,timewasters}.txt next to the
+# script. One domain per line; '#' starts a comment, blank lines ignored.
+# Falls back to a legacy single-file blocklists.txt if present (for older
+# clones), and finally to embedded defaults so the script works standalone.
+# Files may be edited freely between blocks; edits do NOT affect a block
+# already in progress (its domains were baked into /etc/hosts at activation).
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-BLOCKLIST_FILE="$SCRIPT_DIR/blocklists.txt"
+BLOCKLIST_DIR="$SCRIPT_DIR/blocklists"
+LEGACY_BLOCKLIST_FILE="$SCRIPT_DIR/blocklists.txt"
 
 BLOCKS_SOCIAL=()
 BLOCKS_ADULT=()
 BLOCKS_TIMEWASTERS=()
 
-load_blocklists() {
+load_category_file() {
+    # Strip comments and blank lines; print one domain per line on stdout.
+    local file="$1" line
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -n "$line" ] && printf '%s\n' "$line"
+    done < "$file"
+}
+
+load_legacy_blocklist() {
+    # INI-style parser kept for backward compatibility with the old
+    # single-file layout. Removed once no clone in the wild still uses it.
     local file="$1" line section=""
     while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%%#*}"                                 # strip comments
-        line="${line#"${line%%[![:space:]]*}"}"            # ltrim
-        line="${line%"${line##*[![:space:]]}"}"            # rtrim
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
         [ -z "$line" ] && continue
         if [[ "$line" =~ ^\[(.+)\]$ ]]; then
             section="${BASH_REMATCH[1]}"
@@ -288,9 +304,15 @@ load_blocklists() {
     done < "$file"
 }
 
-if [ -f "$BLOCKLIST_FILE" ]; then
-    load_blocklists "$BLOCKLIST_FILE"
-else
+if [ -d "$BLOCKLIST_DIR" ]; then
+    mapfile -t BLOCKS_SOCIAL      < <(load_category_file "$BLOCKLIST_DIR/social.txt")
+    mapfile -t BLOCKS_ADULT       < <(load_category_file "$BLOCKLIST_DIR/adult.txt")
+    mapfile -t BLOCKS_TIMEWASTERS < <(load_category_file "$BLOCKLIST_DIR/timewasters.txt")
+elif [ -f "$LEGACY_BLOCKLIST_FILE" ]; then
+    load_legacy_blocklist "$LEGACY_BLOCKLIST_FILE"
+fi
+
+if [ ${#BLOCKS_SOCIAL[@]} -eq 0 ] && [ ${#BLOCKS_ADULT[@]} -eq 0 ] && [ ${#BLOCKS_TIMEWASTERS[@]} -eq 0 ]; then
     BLOCKS_SOCIAL=(facebook.com www.facebook.com instagram.com www.instagram.com twitter.com www.twitter.com x.com www.x.com reddit.com www.reddit.com old.reddit.com tiktok.com www.tiktok.com)
     BLOCKS_ADULT=(pornhub.com www.pornhub.com xvideos.com www.xvideos.com xnxx.com www.xnxx.com redtube.com www.redtube.com rule34.xxx www.rule34.xxx spankbang.com www.spankbang.com)
     BLOCKS_TIMEWASTERS=(youtube.com www.youtube.com netflix.com www.netflix.com twitch.tv www.twitch.tv hulu.com www.hulu.com)

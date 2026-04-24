@@ -16,14 +16,21 @@ use glib::{clone, ControlFlow, Priority};
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, ButtonsType, ComboBoxText,
-    Dialog, DialogFlags, Entry, Label, MessageDialog, MessageType, Orientation, PolicyType,
-    ProgressBar, ResponseType, ScrolledWindow, SpinButton, Stack, TextView,
+    Dialog, DialogFlags, Entry, Label, MessageDialog, MessageType, Notebook, Orientation,
+    PolicyType, ProgressBar, ResponseType, ScrolledWindow, SpinButton, Stack, TextView,
 };
 
 const APP_ID: &str = "org.distractions.gui";
 const STATE_DIR: &str = "/var/lib/hardblock";
 const SCRIPT_NAME: &str = "distractions--.sh";
-const BLOCKLIST_NAME: &str = "blocklists.txt";
+const BLOCKLIST_DIR_NAME: &str = "blocklists";
+
+/// Per-category blocklist files. (tab label, filename inside BLOCKLIST_DIR_NAME)
+const BLOCKLIST_CATEGORIES: &[(&str, &str)] = &[
+    ("Social media", "social.txt"),
+    ("Adult content", "adult.txt"),
+    ("Time wasters", "timewasters.txt"),
+];
 
 const PRESETS: &[(&str, &str)] = &[
     ("none", "No preset (use custom sites only)"),
@@ -143,16 +150,16 @@ struct Ui {
     timer_label: Label,
     end_label: Label,
     script_path: PathBuf,
-    blocklist_path: PathBuf,
+    blocklist_dir: PathBuf,
     stderr_buffer: RefCell<Vec<String>>,
     countdown_running: RefCell<bool>,
 }
 
 fn build_ui(app: &Application, script_path: PathBuf) {
-    let blocklist_path = script_path
+    let blocklist_dir = script_path
         .parent()
-        .map(|p| p.join(BLOCKLIST_NAME))
-        .unwrap_or_else(|| PathBuf::from(BLOCKLIST_NAME));
+        .map(|p| p.join(BLOCKLIST_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(BLOCKLIST_DIR_NAME));
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -265,7 +272,7 @@ WARNING: activation cannot be reversed until the timer expires.\
         timer_label,
         end_label,
         script_path,
-        blocklist_path,
+        blocklist_dir,
         stderr_buffer: RefCell::new(Vec::new()),
         countdown_running: RefCell::new(false),
     });
@@ -544,11 +551,11 @@ Block ended.</span>",
 
 fn open_blocklist_editor(ui: &Rc<Ui>) {
     let dialog = Dialog::builder()
-        .title("Edit blocklists.txt")
+        .title("Edit blocklists")
         .transient_for(&ui.window)
         .modal(true)
-        .default_width(580)
-        .default_height(540)
+        .default_width(640)
+        .default_height(580)
         .build();
     dialog.add_button("Cancel", ResponseType::Cancel);
     let save_btn = dialog.add_button("Save", ResponseType::Ok);
@@ -561,47 +568,48 @@ fn open_blocklist_editor(ui: &Rc<Ui>) {
     let info = Label::new(None);
     info.set_markup(
         "<small>Edits apply to the <b>next</b> activation, not to a \
-block already in progress.</small>",
+block already in progress. Only modified tabs are written.</small>",
     );
     info.set_xalign(0.0);
     content.pack_start(&info, false, false, 0);
 
-    let scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Automatic)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .build();
-    let textview = TextView::new();
-    textview.set_monospace(true);
-    textview.set_left_margin(8);
-    textview.set_right_margin(8);
-    textview.set_top_margin(8);
-    textview.set_bottom_margin(8);
+    let notebook = Notebook::new();
+    // Per tab: (path, textview, original_text). Save loop only writes tabs
+    // whose buffer text differs from the original.
+    let mut tabs: Vec<(PathBuf, TextView, String)> = Vec::new();
 
-    let initial = match std::fs::read_to_string(&ui.blocklist_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            "# blocklists.txt did not exist; will be created on save.\n\
-[social]\n\n[adult]\n\n[timewasters]\n"
-                .to_string()
-        }
-        Err(e) => format!("# Failed to read {}: {}\n", ui.blocklist_path.display(), e),
-    };
-    let buffer = textview.buffer().expect("TextView always has a buffer");
-    buffer.set_text(&initial);
-    scroll.add(&textview);
-    content.pack_start(&scroll, true, true, 0);
+    for (label, filename) in BLOCKLIST_CATEGORIES {
+        let path = ui.blocklist_dir.join(filename);
+        let scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::Automatic)
+            .vscrollbar_policy(PolicyType::Automatic)
+            .build();
+        let textview = TextView::new();
+        textview.set_monospace(true);
+        textview.set_left_margin(8);
+        textview.set_right_margin(8);
+        textview.set_top_margin(8);
+        textview.set_bottom_margin(8);
+
+        let initial = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                format!("# {} will be created on save.\n", filename)
+            }
+            Err(e) => format!("# Failed to read {}: {}\n", path.display(), e),
+        };
+        let buffer = textview.buffer().expect("TextView always has a buffer");
+        buffer.set_text(&initial);
+        scroll.add(&textview);
+        notebook.append_page(&scroll, Some(&Label::new(Some(label))));
+        tabs.push((path, textview, initial));
+    }
+    content.pack_start(&notebook, true, true, 0);
     dialog.show_all();
 
     let response = dialog.run();
     let save_error = if response == ResponseType::Ok {
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), true)
-            .map(|g| g.to_string())
-            .unwrap_or_default();
-        match std::fs::write(&ui.blocklist_path, text) {
-            Ok(()) => None,
-            Err(e) => Some(format!("{}: {}", ui.blocklist_path.display(), e)),
-        }
+        save_modified_tabs(&ui.blocklist_dir, &tabs)
     } else {
         None
     };
@@ -619,6 +627,29 @@ block already in progress.</small>",
         dlg.run();
         dlg.close();
     }
+}
+
+fn save_modified_tabs(
+    blocklist_dir: &Path,
+    tabs: &[(PathBuf, TextView, String)],
+) -> Option<String> {
+    if let Err(e) = std::fs::create_dir_all(blocklist_dir) {
+        return Some(format!("{}: {}", blocklist_dir.display(), e));
+    }
+    for (path, textview, original) in tabs {
+        let buffer = textview.buffer().expect("TextView always has a buffer");
+        let current = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .map(|g| g.to_string())
+            .unwrap_or_default();
+        if current == *original {
+            continue;
+        }
+        if let Err(e) = std::fs::write(path, current) {
+            return Some(format!("{}: {}", path.display(), e));
+        }
+    }
+    None
 }
 
 fn main() {

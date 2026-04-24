@@ -1,0 +1,16 @@
+# Social media domains. One per line. '#' starts a comment; blank lines ignored.
+# Edits apply to the NEXT activation, not to a block already in progress.
+
+facebook.com
+www.facebook.com
+instagram.com
+www.instagram.com
+twitter.com
+www.twitter.com
+x.com
+www.x.com
+reddit.com
+www.reddit.com
+old.reddit.com
+tiktok.com
+www.tiktok.com
